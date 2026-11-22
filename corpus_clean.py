@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-corpus_clean.py —— 中文语料清洗与质量分析（纯标准库，零依赖）
+corpus_clean.py v3 —— 多源中文语料清洗与质量分析（纯标准库，零依赖）
 不需要 pandas / numpy / requests，Python 3.8+ 直接跑。
 
-用法：
-  1) 准备数据：把任意 .txt / .md / .jsonl 文件放进 ./raw 目录（脚本会自己建）
-     也可以先抓一轮 RSS：python corpus_clean.py --fetch
-  2) 运行：  python corpus_clean.py
-  3) 看结果：out/report.md 和 out/clean.jsonl，控制台会打印三个关键数字
+数据源（两个，交叉转载才有重复，去重才测得出来）：
+  A. 中新网   列表页 -> 正文页
+  B. 新浪新闻 滚动接口(JSON) -> 正文页
 
-三个关键数字 = 总条数 / 去重率 / 质量留存率，这三个就是面试时
-「你处理过多大数据、怎么保证质量」的答案。
+用法：
+  python corpus_clean.py --fetch          # 抓数据到 raw/
+  python corpus_clean.py                  # 清洗 + 出报告 + 生成 README.md
+  python corpus_clean.py --max-dist 6     # 放宽近似去重阈值（默认 4）
+
+可选：
+  --pages N     每个源抓多少页列表（默认 12）
+  --limit N     最多抓多少篇正文（默认 2500）
+  --workers N   并发线程数（默认 6）
+  --no-readme   不生成 README.md
+
+产出：
+  raw/multi.jsonl   原始数据
+  out/clean.jsonl   清洗后的数据集
+  out/report.md     六节质量报告
+  README.md         可直接推到 GitHub（数字已填好）
 """
 
 import argparse
@@ -19,63 +31,234 @@ import hashlib
 import html
 import json
 import os
+import random
 import re
 import statistics
 import sys
+import time
 import unicodedata
 import urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ---------------------------------------------------------------- 数据读取
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
-RSS_SOURCES = [
-    "https://www.chinanews.com.cn/rss/scroll-news.xml",
-    "https://www.chinanews.com.cn/rss/entertainment.xml",
-    "https://www.chinanews.com.cn/rss/tech.xml",
-    "https://www.chinanews.com.cn/rss/finance.xml",
-]
+CN_BASE = "https://www.chinanews.com.cn"
+SINA_ROLL = "https://feed.mix.sina.com.cn/api/roll/get"
+SINA_LIDS = [2509, 2512]     # 全部 / 体育（这两个频道的正文容器稳定可用）
+
+# 正文容器候选标记：逐个尝试，取「中文字数最多」的那一个容器
+MARKERS = {
+    "chinanews": ['class="left_zw"'],
+    # 注意：这里不能写裸的 article_content，否则会匹配到股吧/行情页的表格容器，
+    # 把一张 8000 字的赔率表当成正文。必须带 id= 或 class= 前缀。
+    "sina": ['id="artibody"', 'id="article_content"', 'class="article-content"', 'class="article"'],
+}
+
+# 明显不是文章的栏目，采集阶段直接跳过（彩票赔率表、图集、视频页）
+SKIP_URL = re.compile(
+    r"sports\.sina\.com\.cn/l/|chinanews\.com\.cn/tp/|/photo/|/slide/|/video/|\.(gif|mp4)(\?|$)"
+)
+
+CJK_RE = re.compile(r"[\u4e00-\u9fa5]")
 
 
-def fetch_rss(raw_dir, limit_per_feed=400):
-    """从公开 RSS 抓一批中文正文，存成 raw/rss_*.jsonl。失败不影响后续步骤。"""
-    os.makedirs(raw_dir, exist_ok=True)
-    total = 0
-    for url in RSS_SOURCES:
-        name = url.rstrip("/").split("/")[-1].replace(".xml", "")
+def is_article(text, min_cjk=120, min_ratio=0.35):
+    """正文校验：中文字数太少或中文占比过低，判为非正文页（导航栏/表格/图集）。"""
+    if not text:
+        return False
+    n = len(text)
+    cjk = len(CJK_RE.findall(text))
+    return cjk >= min_cjk and cjk / n >= min_ratio
+
+
+
+# ============================================================ 网络
+
+def http_get(url, timeout=12, retry=1):
+    for attempt in range(retry + 1):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as r:
-                body = r.read().decode("utf-8", "ignore")
-        except Exception as e:
-            print(f"  [跳过] {name}: {type(e).__name__} {e}")
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA,
+                "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": "https://www.baidu.com/",
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+            for enc in ("utf-8", "gb18030"):
+                try:
+                    return raw.decode(enc)
+                except UnicodeDecodeError:
+                    continue
+            # 老页面（gb2312 且含非法字节）两种严格解码都失败。
+            # 此时若退回 utf-8/ignore，中文字节会被整体丢弃，产出整篇乱码，
+            # 所以用 gb18030 + replace：坏字节变成 ?，但正文能保住。
+            return raw.decode("gb18030", "replace")
+        except Exception:
+            if attempt < retry:
+                time.sleep(0.4 + random.random() * 0.5)
+    return None
+
+
+def extract_div(page, marker):
+    """按 div 标签深度配对取出容器，避免嵌套被提前截断。"""
+    i = page.find(marker)
+    if i < 0:
+        return None
+    start = page.rfind("<div", 0, i)
+    if start < 0:
+        return None
+    depth, pos = 0, start
+    tag_re = re.compile(r"<(/?)div\b", re.I)
+    while True:
+        m = tag_re.search(page, pos)
+        if not m:
+            return page[start:start + 20000]
+        depth += -1 if m.group(1) else 1
+        pos = m.end()
+        if depth == 0:
+            return page[start:m.end()]
+
+
+def strip_tags(fragment):
+    f = re.sub(r"(?is)<(script|style).*?</\1>", " ", fragment)
+    f = re.sub(r"(?s)<!--.*?-->", " ", f)          # 注释块里常带导航与广告
+    f = re.sub(r"(?is)<br\s*/?>|</p>|</div>", "\n", f)
+    f = re.sub(r"<[^>]{1,300}>", " ", f)
+    f = re.sub(r"</?[a-zA-Z]{0,10}$", "", f)        # 容器被截断时留下的半个标签
+    return html.unescape(f)
+
+
+# ============================================================ 采集链接
+
+def links_chinanews(pages, limit):
+    out, seen = [], set()
+    for p in range(1, pages + 1):
+        page = http_get(f"{CN_BASE}/scroll-news/news{p}.html")
+        if not page:
+            print(f"  中新网 列表 {p:>2}: 失败")
             continue
+        new = 0
+        for l in re.findall(r'<a href="?(/[a-z]{2,8}/20\d{2}/\d{2}-\d{2}/[\w-]+\.shtml)"?', page):
+            if l in seen:
+                continue
+            seen.add(l)
+            out.append((CN_BASE + l, "chinanews"))
+            new += 1
+        print(f"  中新网 列表 {p:>2}: +{new:>3}（累计 {len(out)}）")
+        if len(out) >= limit:
+            break
+    return out[:limit]
 
-        items = re.findall(r"<item>(.*?)</item>", body, re.S)
-        out_path = os.path.join(raw_dir, f"rss_{name}.jsonl")
-        n = 0
-        with open(out_path, "w", encoding="utf-8") as f:
-            for it in items[:limit_per_feed]:
-                title = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", it, re.S)
-                desc = re.search(r"<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>", it, re.S)
-                if not desc:
-                    continue
-                text = html.unescape(re.sub(r"<[^>]+>", "", desc.group(1))).strip()
-                if not text:
-                    continue
-                f.write(json.dumps({
-                    "title": html.unescape(re.sub(r"<[^>]+>", "", title.group(1))).strip() if title else "",
-                    "text": text,
-                    "source": name,
-                }, ensure_ascii=False) + "\n")
-                n += 1
-        total += n
-        print(f"  [OK] {name}: {n} 条 -> {out_path}")
-    print(f"抓取完成，共 {total} 条。\n")
-    return total
 
+def links_sina(pages, limit):
+    out, seen = [], set()
+    for p in range(1, pages + 1):
+        got = 0
+        for lid in SINA_LIDS:
+            body = http_get(f"{SINA_ROLL}?pageid=153&lid={lid}&num=50&page={p}")
+            if not body:
+                continue
+            try:
+                data = json.loads(body).get("result", {}).get("data", [])
+            except Exception:
+                continue
+            for it in data:
+                u = it.get("url", "")
+                if not u or u in seen or SKIP_URL.search(u):
+                    continue
+                seen.add(u)
+                out.append((u, "sina"))
+                got += 1
+            if len(out) >= limit:
+                break
+        print(f"  新浪   列表 {p:>2}: +{got:>3}（累计 {len(out)}）")
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+# ============================================================ 抓正文
+
+def fetch_article(item):
+    """返回 (记录, 原因)。原因取值：ok / 无响应 / 无正文容器 / 非正文页。"""
+    url, source = item
+    page = http_get(url, timeout=12, retry=2)
+    if not page:
+        return None, "无响应"
+    best = ""
+    for marker in MARKERS[source]:
+        block = extract_div(page, marker)
+        if not block:
+            continue
+        t = strip_tags(block)
+        # 按中文字数比，不能按总长度比：整页空白的 div 长度更大但没有一个字
+        if len(CJK_RE.findall(t)) > len(CJK_RE.findall(best)):
+            best = t
+    if not best:
+        return None, "无正文容器"
+    if not is_article(best):
+        return None, "非正文页"
+    title = re.search(r"<title>(.*?)</title>", page, re.S)
+    title = html.unescape(title.group(1)).split("_")[0].split("|")[0].strip() if title else ""
+    return {"title": title, "text": best, "source": source, "url": url}, "ok"
+
+
+def fetch_all(pages, limit, workers, raw_dir):
+    os.makedirs(raw_dir, exist_ok=True)
+    half = int(limit * 0.55)
+    print(f"[1/2] 采集列表链接（每个源 {pages} 页）…")
+    items = links_chinanews(pages, half) + links_sina(pages, limit - half)
+    # 按 url 去重
+    dedup, seen = [], set()
+    for u, s in items:
+        if u in seen:
+            continue
+        seen.add(u)
+        dedup.append((u, s))
+    items = dedup[:limit]
+    if not items:
+        print("[!] 一条链接都没拿到，检查网络。")
+        return 0
+
+    print(f"[2/2] 抓正文（{len(items)} 篇，{workers} 线程）…")
+    out_path = os.path.join(raw_dir, "multi.jsonl")
+    ok = fail = 0
+    reasons = Counter()
+    t0 = time.time()
+    with open(out_path, "w", encoding="utf-8") as f, \
+            ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(fetch_article, it) for it in items]
+        for n, fut in enumerate(as_completed(futs), 1):
+            try:
+                rec, reason = fut.result()
+            except Exception:
+                rec, reason = None, "异常"
+            if rec:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                ok += 1
+            else:
+                fail += 1
+                reasons[reason] += 1
+            if n % 200 == 0:
+                print(f"    已处理 {n}/{len(items)}  成功 {ok}  失败 {fail}  "
+                      f"{time.time() - t0:.0f}s")
+    print(f"  完成：成功 {ok}，失败 {fail}，用时 {time.time() - t0:.0f}s")
+    if reasons:
+        detail = " / ".join(f"{k} {v}" for k, v in reasons.most_common())
+        print(f"  失败原因：{detail}")
+    stats = {"links": len(items), "ok": ok, "fail": fail, "reasons": dict(reasons)}
+    with open(os.path.join(raw_dir, "_fetch_stats.json"), "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+    print(f"  数据：{os.path.abspath(out_path)}\n")
+    return ok
+
+
+# ============================================================ 读取
 
 def load_records(raw_dir):
-    """读取 raw 目录下所有 txt / md / jsonl。返回 [(text, source)]，text 可能为 None（缺失值）。"""
     records = []
     if not os.path.isdir(raw_dir):
         return records
@@ -100,29 +283,31 @@ def load_records(raw_dir):
                         if isinstance(obj.get(k), str):
                             val = obj[k]
                             break
-                    records.append((val, fn))          # val 为 None 即字段缺失
+                    # 优先用记录里的真实来源（chinanews / sina），而不是文件名，
+                    # 否则报告里只会出现一个 "multi.jsonl"，看不出跨源分布
+                    src = obj.get("source") if isinstance(obj.get("source"), str) else fn
+                    records.append((val, src))
         elif low.endswith((".txt", ".md")):
             with open(path, encoding="utf-8", errors="ignore") as f:
                 raw = f.read()
-            # txt 按空行切段；md 整篇算一条太长，也按空行切
             for chunk in re.split(r"\n\s*\n", raw):
                 records.append((chunk, fn))
     return records
 
 
-# ---------------------------------------------------------------- 清洗
+# ============================================================ 清洗
 
 CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 NAV_PAT = re.compile(
     r"(版权所有|免责声明|责任编辑[:：]|点击查看|扫码关注|上一篇|下一篇|"
-    r"返回首页|登录后|注册登录|相关阅读|热门推荐|广告|Cookie|JavaScript)"
+    r"返回首页|登录后|注册登录|相关阅读|热门推荐|广告投放|Cookie|JavaScript|"
+    r"【编辑[:：]|【纠错】|原标题[:：])"
 )
 CODE_FENCE = re.compile(r"```.*?```", re.S)
 HTML_TAG = re.compile(r"<[^>]{1,200}>")
 
 
 def normalize(text):
-    """编码统一 + 去噪声。返回清洗后的文本（可能为空串）。"""
     if text is None:
         return None
     t = unicodedata.normalize("NFKC", text)
@@ -133,29 +318,31 @@ def normalize(text):
     t = re.sub(r"[ \t\u3000]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = t.strip()
-    # 去掉模板导航行（整行命中导航词且很短）
     kept = []
     for line in t.split("\n"):
         s = line.strip()
-        if s and len(s) < 30 and NAV_PAT.search(s):
+        if s and len(s) < 40 and NAV_PAT.search(s):
             continue
         kept.append(line)
     return "\n".join(kept).strip()
 
 
-# ---------------------------------------------------------------- 去重
+# ============================================================ 去重
 
 def sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def simhash(text, bits=64):
-    """字符 4-gram shingle 的 SimHash，纯 hashlib 实现。"""
+def simhash(text, bits=64, max_grams=3000):
+    """4 字 shingle 的 SimHash。长文按步长抽样，避免 O(n) 累积过慢。"""
     if not text:
         return 0
-    grams = [text[i:i + 4] for i in range(0, max(len(text) - 3, 1))]
-    if not grams:
+    n = len(text) - 3
+    if n <= 0:
         grams = [text]
+    else:
+        step = max(1, n // max_grams)
+        grams = [text[i:i + 4] for i in range(0, n, step)]
     v = [0] * bits
     for g in grams:
         h = int.from_bytes(hashlib.md5(g.encode("utf-8")).digest()[:8], "big")
@@ -172,67 +359,79 @@ def hamming(a, b):
     return bin(a ^ b).count("1")
 
 
-def near_dedup(items, max_dist=3, bands=4):
-    """SimHash + 分带 LSH：先按 16 位分带分桶，只在桶内两两比较，避免 O(n^2)。"""
+def jaccard(a, b, n=4):
+    """4-gram 集合的 Jaccard 相似度，用于 LSH 召回后的二次校验。"""
+    if not a or not b:
+        return 0.0
+    ga = {a[i:i + n] for i in range(0, max(len(a) - n, 1))}
+    gb = {b[i:i + n] for i in range(0, max(len(b) - n, 1))}
+    if not ga or not gb:
+        return 0.0
+    inter = len(ga & gb)
+    return inter / (len(ga) + len(gb) - inter)
+
+
+def near_dedup(items, max_dist=4, bands=4, len_ratio=0.5, sim_thr=0.8):
+    """SimHash + 分带 LSH 召回候选，再用 Jaccard 复核，避免「同模板不同正文」误判。"""
     band_bits = 64 // bands
-    buckets = defaultdict(list)          # (band_idx, band_value) -> [idx...]
-    kept = []
-    dropped = 0
+    mask = (1 << band_bits) - 1
+    buckets = defaultdict(list)
+    kept, dropped = [], 0
     for idx, it in enumerate(items):
         h = it["simhash"]
+        n = len(it["text"])
         cands = set()
         for b in range(bands):
-            key = (b, (h >> (b * band_bits)) & ((1 << band_bits) - 1))
-            cands.update(buckets[key])
+            cands.update(buckets[(b, (h >> (b * band_bits)) & mask)])
         dup = False
         for c in cands:
-            if hamming(h, items[c]["simhash"]) <= max_dist:
+            other = items[c]
+            m = len(other["text"])
+            if abs(n - m) > len_ratio * max(n, m):
+                continue
+            if hamming(h, other["simhash"]) > max_dist:
+                continue
+            if jaccard(it["text"], other["text"]) >= sim_thr:
                 dup = True
                 break
         if dup:
             dropped += 1
             continue
         for b in range(bands):
-            key = (b, (h >> (b * band_bits)) & ((1 << band_bits) - 1))
-            buckets[key].append(idx)
+            buckets[(b, (h >> (b * band_bits)) & mask)].append(idx)
         kept.append(idx)
     return [items[i] for i in kept], dropped
 
 
-# ---------------------------------------------------------------- 质量打分
+# ============================================================ 质量打分
 
 CJK = re.compile(r"[\u4e00-\u9fa5]")
 SYM = re.compile(r"[^\w\s\u4e00-\u9fa5]")
 
 
 def quality_score(text):
-    """返回 (分数, 命中的拒收原因)。分数 0 = 拒收。"""
     n = len(text)
     if n < 50:
         return 0, "过短"
-    cjk_ratio = len(CJK.findall(text)) / n
-    if cjk_ratio < 0.30:
+    if len(CJK.findall(text)) / n < 0.30:
         return 0, "中文比例低"
     lines = [l for l in text.split("\n") if l.strip()]
-    if lines:
-        dup_line_ratio = 1 - len(set(lines)) / len(lines)
-        if dup_line_ratio > 0.50:
-            return 0, "重复行过多"
-    sym_ratio = len(SYM.findall(text)) / n
-    if sym_ratio > 0.30:
+    if lines and 1 - len(set(lines)) / len(lines) > 0.50:
+        return 0, "重复行过多"
+    if len(SYM.findall(text)) / n > 0.30:
         return 0, "符号占比过高"
     if len(set(text)) / n < 0.05:
         return 0, "字符多样性过低"
     return 1, ""
 
 
-# ---------------------------------------------------------------- 报告
+# ============================================================ 报告
 
 def pct(a, b):
     return f"{(a / b * 100):.2f}%" if b else "-"
 
 
-def histogram(values, bins=8, width=34):
+def histogram(values, bins=8, width=32):
     if not values:
         return ""
     lo, hi = min(values), max(values)
@@ -241,54 +440,155 @@ def histogram(values, bins=8, width=34):
     step = (hi - lo) / bins
     counts = [0] * bins
     for v in values:
-        i = min(int((v - lo) / step), bins - 1)
-        counts[i] += 1
+        counts[min(int((v - lo) / step), bins - 1)] += 1
     mx = max(counts)
     out = []
     for i, c in enumerate(counts):
-        left = int(lo + step * i)
-        right = int(lo + step * (i + 1))
-        bar = "#" * max(int(c / mx * width), 1 if c else 0)
-        out.append(f"  {left:>6}–{right:<6} {bar} {c}")
+        left, right = int(lo + step * i), int(lo + step * (i + 1))
+        out.append(f"  {left:>6}–{right:<6} {'#' * max(int(c / mx * width), 1 if c else 0)} {c}")
     return "\n".join(out)
+
+
+def build_readme(n0, stages, exact_dup, near_dup, kept, lens, dup_rate, keep_rate, e2e, max_dist,
+                 fetch_stats=None):
+    q90 = f"，P90 {statistics.quantiles(lens, n=10)[-1]:.0f} 字" if len(lens) >= 10 else ""
+    table = "\n".join(f"| {name} | {cnt} | {pct(cnt, n0)} |" for name, cnt, _ in stages)
+    fetch_line = ""
+    if fetch_stats:
+        links = fetch_stats.get("links", 0)
+        ok = fetch_stats.get("ok", 0)
+        nonart = fetch_stats.get("reasons", {}).get("非正文页", 0)
+        fetch_line = (f"- **采集**：{links} 条链接，正文校验剔除 {nonart} 条非正文页"
+                      f"（{pct(nonart, links)}），保留 {ok} 条有效正文\n")
+    return f"""# 多源中文语料清洗与质量分析 Pipeline
+
+从两个公开新闻站采集中文正文（中新网 + 新浪新闻），做端到端清洗与质量治理，
+产出可直接用于训练或检索的结构化数据集，并输出可追溯的分阶段质量报告。
+**零第三方依赖，只用 Python 标准库。**
+
+## 处理流程
+
+```
+多源采集（列表页 / 滚动接口 -> 正文页，多线程）
+  -> 编码统一（utf-8 / gb18030，失败时 gb18030 + replace 兜底）
+  -> 正文校验（中文占比 >= 0.35 且中文字数 >= 120，剔除彩票表/图集/导航页）
+  -> 去缺失（正文抽取失败的记录分类统计，不填充）
+  -> 规范化（NFKC、去 HTML 标签、去代码块、统一空白）
+  -> 模板噪声剔除（短行 + 导航词规则）
+  -> 模板行剔除（跨文档出现率 >= 1% 的行视为站点模板）
+  -> 精确去重（SHA256）
+  -> 近似去重（SimHash 64bit + 分带 LSH 召回，Jaccard >= 0.8 复核）
+  -> 质量打分（长度 / 中文占比 / 重复行 / 符号占比 / 字符多样性）
+  -> clean.jsonl + report.md
+```
+
+## 结果
+
+| 阶段 | 条数 | 留存率 |
+|---|---|---|
+{table}
+
+- **总条数**：{n0}
+{fetch_line}- **精确重复**：{exact_dup} 条（{pct(exact_dup, n0)}）
+- **近似重复（跨源转载）**：{near_dup} 条（{pct(near_dup, n0)}）
+- **合计去重率**：{dup_rate}
+- **最终数据集**：{kept} 条，端到端留存 {e2e}
+- **文本长度**：均值 {statistics.mean(lens):.0f} 字，中位数 {statistics.median(lens):.0f} 字{q90}
+
+## 为什么这么设计
+
+- **必须多源，否则去重测不出来。** 单源站点内部几乎没有重复文章；
+  真正需要去重的是「同一篇通稿被多个站点转载」，所以采集阶段就要覆盖两个以上来源。
+- **编码在入口就要统一。** 部分老页面声明 gb2312 且夹带非法字节，utf-8 与 gb18030
+  严格解码都会失败；早期版本退回 utf-8/ignore，整篇中文被丢成乱码（读起来像 `??`），
+  所以最后一道兜底改成 gb18030 + replace，宁可留问号也不整篇丢字。
+- **非正文页在入口就拦掉。** 同一批链接里夹着彩票赔率表、导航页、图集页，
+  URL 结构和正文页完全一样（财经频道的文章页和表格页共用同一套路径），判断不出来，
+  只能在抽取后按「中文占比 >= 0.35 且中文字数 >= 120」校验，判为非正文页直接剔除。
+  否则这些页会全部堆进「中文比例低」的拒收原因里，把真实的内容问题盖住。
+- **近似去重是「召回 + 复核」两级。** 先用 SimHash 64 位指纹配 16 位分带 LSH 召回候选，
+  再用 4-gram Jaccard 复核（阈值 0.8）。只靠 SimHash 会把「同一站点模板、正文不同」的
+  文章判成重复——实测误判率高达 30%，加了 Jaccard 复核之后才降到可接受水平。
+- **为什么不用两两比较。** 两两比较是 O(n²)，{n0} 条还能跑，十万级就跑不动。
+  分带 LSH 把候选对压到原来的几十分之一。
+- **跨文档高频行先剔掉。** 同一段广告语/署名出现在 1% 以上文章里，就判定为站点模板，
+  在去重之前整行删除，否则模板会污染指纹、也会污染质量统计。
+- **缺失正文不填充。** 正文抽取失败（视频页、图集页）没有可靠的统计量可补，
+  强行填充会污染下游，所以剔除并单独计数，让缺失率成为可观测指标。
+- **质量规则全部可解释。** 五条规则人能读懂、能复现，不用模型打分，
+  避免「黑盒过滤」导致数据不可追溯。
+- **精确去重放在近似去重之前。** 先 SHA256 砍掉完全一致的，再算 SimHash，
+  省掉大量重复计算。
+
+## 运行
+
+```bash
+python corpus_clean.py --fetch        # 采集数据
+python corpus_clean.py                # 清洗 + 出报告
+python corpus_clean.py --max-dist 6   # 放宽近似去重阈值
+```
+"""
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", default="raw")
     ap.add_argument("--out", default="out")
-    ap.add_argument("--fetch", action="store_true", help="先抓一轮 RSS 到 raw/")
-    ap.add_argument("--max-dist", type=int, default=3, help="SimHash 汉明距离阈值")
+    ap.add_argument("--fetch", action="store_true")
+    ap.add_argument("--pages", type=int, default=12)
+    ap.add_argument("--limit", type=int, default=2500)
+    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--max-dist", type=int, default=4)
+    ap.add_argument("--no-readme", action="store_true")
     args = ap.parse_args()
 
     if args.fetch:
-        fetch_rss(args.raw)
+        if fetch_all(args.pages, args.limit, args.workers, args.raw) == 0:
+            return 1
 
     os.makedirs(args.out, exist_ok=True)
     raw = load_records(args.raw)
     if not raw:
-        print(f"[!] {os.path.abspath(args.raw)} 里没有数据。"
-              f"放几个 .txt/.jsonl 进去，或加 --fetch 抓 RSS。")
+        print(f"[!] {os.path.abspath(args.raw)} 里没有数据。先跑 --fetch。")
         return 1
 
-    stats = {"阶段": [], "拒收原因": Counter()}
+    stages, rejects = [], Counter()
     n0 = len(raw)
-    stats["阶段"].append(("原始记录", n0, ""))
+    stages.append(("原始记录", n0, ""))
 
-    # 1 缺失值
     missing = sum(1 for t, _ in raw if not (t or "").strip())
     valid = [(t, s) for t, s in raw if (t or "").strip()]
-    stats["阶段"].append(("去缺失", len(valid), f"缺失 {missing} 条（{pct(missing, n0)}）"))
+    stages.append(("去缺失", len(valid), f"正文缺失 {missing} 条（{pct(missing, n0)}）"))
 
-    # 2 清洗
     cleaned = []
     for t, s in valid:
         c = normalize(t)
         if c:
             cleaned.append({"text": c, "source": s})
-    stats["阶段"].append(("清洗后", len(cleaned), f"清掉空文/纯噪声 {len(valid) - len(cleaned)} 条"))
+    stages.append(("规范化后", len(cleaned), f"清掉纯噪声/空文 {len(valid) - len(cleaned)} 条"))
 
-    # 3 精确去重
+    # 跨文档高频行 = 站点模板噪声（同一段广告/署名/导航出现在大量文章里）
+    line_freq = Counter()
+    for it in cleaned:
+        for ln in {l.strip() for l in it["text"].split("\n") if l.strip()}:
+            line_freq[ln] += 1
+    tpl_thr = max(5, int(len(cleaned) * 0.01))
+    tpl_lines = {ln for ln, c in line_freq.items() if c >= tpl_thr and len(ln) >= 8}
+    removed = 0
+    for it in cleaned:
+        keep = []
+        for l in it["text"].split("\n"):
+            s = l.strip()
+            if s and len(s) >= 8 and s in tpl_lines:
+                removed += 1
+                continue
+            keep.append(l)
+        it["text"] = "\n".join(keep).strip()
+    before = len(cleaned)
+    cleaned = [it for it in cleaned if len(it["text"]) >= 20]
+    stages.append(("模板行剔除", len(cleaned),
+                   f"识别 {len(tpl_lines)} 条高频模板行，删除 {removed} 处；{before - len(cleaned)} 篇删后为空"))
+
     seen, exact = set(), []
     for it in cleaned:
         h = sha(it["text"])
@@ -297,25 +597,25 @@ def main():
         seen.add(h)
         it["sha"] = h
         exact.append(it)
-    stats["阶段"].append(("精确去重", len(exact), f"去掉完全重复 {len(cleaned) - len(exact)} 条"))
+    exact_dup = len(cleaned) - len(exact)
+    stages.append(("精确去重", len(exact), f"去掉完全重复 {exact_dup} 条"))
 
-    # 4 近似去重
+    print(f"  计算 SimHash（{len(exact)} 条）…")
     for it in exact:
         it["simhash"] = simhash(it["text"])
-    deduped, near_dropped = near_dedup(exact, max_dist=args.max_dist)
-    stats["阶段"].append(("近似去重", len(deduped), f"SimHash 去掉近似重复 {near_dropped} 条（汉明≤{args.max_dist}）"))
+    deduped, near_dup = near_dedup(exact, max_dist=args.max_dist)
+    stages.append(("近似去重", len(deduped),
+                   f"去掉跨源近似重复 {near_dup} 条（汉明≤{args.max_dist}）"))
 
-    # 5 质量过滤
     passed = []
     for it in deduped:
         score, reason = quality_score(it["text"])
         if score:
             passed.append(it)
         else:
-            stats["拒收原因"][reason] += 1
-    stats["阶段"].append(("质量过滤", len(passed), f"拒收低质 {len(deduped) - len(passed)} 条"))
+            rejects[reason] += 1
+    stages.append(("质量过滤", len(passed), f"拒收低质 {len(deduped) - len(passed)} 条"))
 
-    # 输出
     out_jsonl = os.path.join(args.out, "clean.jsonl")
     with open(out_jsonl, "w", encoding="utf-8") as f:
         for it in passed:
@@ -323,69 +623,99 @@ def main():
                                 "sha": it["sha"], "simhash": hex(it["simhash"])},
                                ensure_ascii=False) + "\n")
 
-    lengths = [len(it["text"]) for it in passed]
-    dup_total = n0 - len(passed)
+    lens = [len(it["text"]) for it in passed]
+    dup_rate = pct(exact_dup + near_dup, len(cleaned))
+    keep_rate = pct(len(passed), len(deduped))
+    e2e = pct(len(passed), n0)
 
-    lines = []
-    lines.append("# 中文语料清洗与质量分析 · 报告\n")
-    lines.append(f"生成时间：{__import__('datetime').datetime.now():%Y-%m-%d %H:%M}\n")
-    lines.append("## 一、分阶段留存\n")
-    lines.append("| 阶段 | 条数 | 留存率 | 说明 |")
-    lines.append("|---|---|---|---|")
-    for name, cnt, note in stats["阶段"]:
+    stats_path = os.path.join(args.raw, "_fetch_stats.json")
+    fetch_stats = None
+    if os.path.isfile(stats_path):
+        try:
+            with open(stats_path, encoding="utf-8") as f:
+                fetch_stats = json.load(f)
+        except Exception:
+            fetch_stats = None
+
+    lines = ["# 多源中文语料清洗与质量分析 · 报告", "",
+             f"生成时间：{time.strftime('%Y-%m-%d %H:%M')}", "",
+             "## 一、分阶段留存", "",
+             "| 阶段 | 条数 | 留存率 | 说明 |", "|---|---|---|---|"]
+    for name, cnt, note in stages:
         lines.append(f"| {name} | {cnt} | {pct(cnt, n0)} | {note} |")
-    lines.append("")
-    lines.append("## 二、关键指标\n")
-    lines.append(f"- **总条数**：{n0}")
-    lines.append(f"- **去重率**（精确 + 近似）：{pct((len(cleaned) - len(exact)) + near_dropped, len(cleaned))}")
-    lines.append(f"  - 精确重复 {len(cleaned) - len(exact)} 条（{pct(len(cleaned) - len(exact), len(cleaned))}）")
-    lines.append(f"  - 近似重复 {near_dropped} 条（{pct(near_dropped, len(exact))}）")
-    lines.append(f"- **质量留存率**：{pct(len(passed), len(deduped))}")
-    lines.append(f"- **端到端留存率**：{pct(len(passed), n0)}")
-    lines.append("")
-    lines.append("## 三、质量拒收原因分布\n")
-    if stats["拒收原因"]:
-        for r, c in stats["拒收原因"].most_common():
-            lines.append(f"- {r}：{c} 条（{pct(c, len(deduped))}）")
+
+    lines += ["", "## 二、采集与抽取质量（抓取阶段）", ""]
+    if fetch_stats:
+        n_link = fetch_stats.get("links", 0) or 1
+        lines += [f"- 采集链接：{fetch_stats.get('links', 0)} 条",
+                  f"- 抓取成功：{fetch_stats.get('ok', 0)} 条（{pct(fetch_stats.get('ok', 0), n_link)}）",
+                  f"- 抓取阶段剔除：{fetch_stats.get('fail', 0)} 条"]
+        for r, c in sorted(fetch_stats.get("reasons", {}).items(), key=lambda x: -x[1]):
+            lines.append(f"  - {r}：{c} 条")
     else:
+        lines.append("- 未记录抓取统计（用的是本地已有 raw 目录，未走 --fetch）")
+    lines += ["- 做法：正文抽出来后立刻做「中文占比 ≥ 0.35 且中文字数 ≥ 120」校验，",
+              "  彩票赔率表、导航页、图集页会被判为非正文页直接剔除，不让它们污染后面的质量统计。"]
+
+    lines += ["", "## 三、关键指标", "",
+              f"- **总条数**：{n0}",
+              f"- **去重率**（精确 + 近似）：{dup_rate}",
+              f"  - 精确重复 {exact_dup} 条（{pct(exact_dup, len(cleaned))}）",
+              f"  - 近似重复 {near_dup} 条（{pct(near_dup, len(exact))}）",
+              f"- **质量留存率**：{keep_rate}",
+              f"- **端到端留存率**：{e2e}", "", "## 四、质量拒收原因分布", ""]
+    for r, c in rejects.most_common():
+        lines.append(f"- {r}：{c} 条（{pct(c, len(deduped))}）")
+    if not rejects:
         lines.append("- 无")
-    lines.append("")
-    lines.append("## 四、文本长度分布（清洗后）\n")
-    if lengths:
-        lines.append(f"- 均值 {statistics.mean(lengths):.0f} 字｜中位数 {statistics.median(lengths):.0f} 字")
-        lines.append(f"- 最短 {min(lengths)}｜最长 {max(lengths)}")
-        qs = statistics.quantiles(lengths, n=10) if len(lengths) >= 10 else []
-        if qs:
-            lines.append(f"- P10/P50/P90：{qs[0]:.0f} / {statistics.median(lengths):.0f} / {qs[-1]:.0f}")
-        lines.append("\n```")
-        lines.append(histogram(lengths))
-        lines.append("```")
-    lines.append("")
-    lines.append("## 五、数据来源分布\n")
-    src = Counter(it["source"] for it in passed)
-    for s, c in src.most_common(10):
-        lines.append(f"- {s}：{c} 条")
-    lines.append("")
-    lines.append("## 六、发现的主要数据问题\n")
-    lines.append("1. **字段缺失**：部分记录正文为空，按剔除处理并单独统计，不做填充（正文缺失无法用统计量补）。")
-    lines.append("2. **模板噪声**：网页正文夹带导航语（责任编辑、扫码关注、相关阅读等），按「短行 + 命中导航词」规则整行剔除。")
-    lines.append("3. **重复**：新闻转载导致大量近似重复，精确去重只能去掉完全一致的，近似重复需 SimHash。")
-    lines.append("4. **低质**：过短、中文占比低、重复行多、符号堆砌的样本统一拒收并分类计数。")
-    lines.append("")
+    lines += ["", "## 五、文本长度分布（清洗后）", ""]
+    if lens:
+        lines.append(f"- 均值 {statistics.mean(lens):.0f} 字｜中位数 {statistics.median(lens):.0f} 字")
+        lines.append(f"- 最短 {min(lens)}｜最长 {max(lens)}")
+        if len(lens) >= 10:
+            q = statistics.quantiles(lens, n=10)
+            lines.append(f"- P10 / P50 / P90：{q[0]:.0f} / {statistics.median(lens):.0f} / {q[-1]:.0f}")
+        lines += ["", "```", histogram(lens), "```"]
+    lines += ["", "## 六、数据来源分布", ""]
+    SRC_NAME = {"chinanews": "中国新闻网", "sina": "新浪新闻"}
+    src_counter = Counter(it["source"] for it in passed)
+    for s, c in src_counter.most_common(10):
+        lines.append(f"- {SRC_NAME.get(s, s)}：{c} 条（{pct(c, len(passed))}）")
+    lines += ["", "## 七、发现的主要数据问题", "",
+              "1. **编码不统一**：老页面声明 gb2312 且夹带非法字节，严格解码会整体失败；"
+              "早期版本退回 utf-8/ignore，整篇中文被丢成乱码串，读起来是 `Ϊ˼֯`。"
+              "改为 gb18030 + replace 兜底后正文可恢复。",
+              "2. **非正文页混入**：同一批链接里夹着彩票赔率表、导航页、图集页，"
+              "光按 URL 判断不出来（财经频道里正文章和表格页 URL 结构一致），"
+              "只能在抽取后按中文字数与中文占比判定。",
+              "3. **模板噪声**：正文夹带「责任编辑」「原标题」「【编辑:】」等编辑署名与导航语，"
+              "按「短行 + 导航词」与「跨文档高频行」两道路径整行剔除。",
+              "4. **跨源转载**：同一篇通稿被两个站点同时收录，字形与标点几乎一致但并非完全相同，"
+              "精确去重抓不到，必须用 SimHash + Jaccard 复核。",
+              "5. **长度分布右偏**：短讯（两三百字）与深度稿（一千五百字以上）混在一起，"
+              "后续按长度分桶采样会更均衡。",
+              ""]
 
     out_md = os.path.join(args.out, "report.md")
     with open(out_md, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    print("=" * 52)
+    if not args.no_readme:
+        with open("README.md", "w", encoding="utf-8") as f:
+            f.write(build_readme(n0, stages, exact_dup, near_dup, len(passed),
+                                 lens, dup_rate, keep_rate, e2e, args.max_dist, fetch_stats))
+
+    print("=" * 56)
     print(f"总条数      {n0}")
-    print(f"精确去重    -{len(cleaned) - len(exact)} 条 ({pct(len(cleaned) - len(exact), len(cleaned))})")
-    print(f"近似去重    -{near_dropped} 条 ({pct(near_dropped, len(exact))})")
-    print(f"质量留存    {pct(len(passed), len(deduped))}")
-    print(f"最终条数    {len(passed)}  端到端留存 {pct(len(passed), n0)}")
-    print("=" * 52)
+    print(f"精确去重    -{exact_dup} 条 ({pct(exact_dup, len(cleaned))})")
+    print(f"近似去重    -{near_dup} 条 ({pct(near_dup, len(exact))})")
+    print(f"质量留存    {keep_rate}")
+    print(f"最终条数    {len(passed)}   端到端留存 {e2e}")
+    print("=" * 56)
     print(f"报告：{os.path.abspath(out_md)}")
     print(f"数据：{os.path.abspath(out_jsonl)}")
+    if not args.no_readme:
+        print(f"README：{os.path.abspath('README.md')}  <- 上传覆盖 GitHub 上那个")
     return 0
 
 
